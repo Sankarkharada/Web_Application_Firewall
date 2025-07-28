@@ -1,103 +1,151 @@
-from http.server import SimpleHTTPRequestHandler, HTTPServer
-from urllib import request, error, parse
-import numpy as np
-import pandas as pd
-import pickle
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+import http.server
+import socketserver
+from urllib.parse import urlparse, parse_qs
+import urllib.request
+import joblib
+import re
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
 
-badwords = ['sleep', 'uid', 'select', 'waitfor', 'delay', 'system', 'union', 'order by', 'group by', 'admin', 'drop',
-            'script']
+# Suppress sklearn version warning
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
+# Load the ML model
+model = joblib.load("training_model.pkl")
+print("✅ Model loaded successfully.")
 
-# Define the ExtractFeatures function outside the class
-def ExtractFeatures(path, body):
-    path = str(path)
-    body = str(body)
-    combined_raw = path + body
-    raw_percentages = combined_raw.count("%")
-    raw_spaces = combined_raw.count(" ")
+PORT = 8080
 
-    # Check if both counts exceed the threshold
-    raw_percentages_count = raw_percentages if raw_percentages > 3 else 0
-    raw_spaces_count = raw_spaces if raw_spaces > 3 else 0
-
-    # Decode the path and body for other feature extractions
-    path_decoded = urllib.parse.unquote_plus(path)
-    body_decoded = urllib.parse.unquote_plus(body)
-
-    single_q = path_decoded.count("'") + body_decoded.count("'")
-    double_q = path_decoded.count("\"") + body_decoded.count("\"")
-    dashes = path_decoded.count("--") + body_decoded.count("--")
-    braces = path_decoded.count("(") + body_decoded.count("(")
-    spaces = path_decoded.count(" ") + body_decoded.count(" ")
-    semicolons = path_decoded.count(";") + body_decoded.count(";")
-    angle_brackets = path_decoded.count("<") + path_decoded.count(">") + body_decoded.count("<") + body_decoded.count(
-        ">")
-    special_chars = sum(path_decoded.count(c) + body_decoded.count(c) for c in '$&|')
-
-    badwords_count = sum(path_decoded.lower().count(word) + body_decoded.lower().count(word) for word in badwords)
-
-    path_length = len(path_decoded)
-    body_length = len(body_decoded)
-
-    return [single_q, double_q, dashes, braces, spaces, raw_percentages_count, semicolons, angle_brackets,
-            special_chars, path_length, body_length, badwords_count]
-
-
-# Define the SimpleHTTPProxy class
-class SimpleHTTPProxy(SimpleHTTPRequestHandler):
-    proxy_routes = {}
-
-    @classmethod
-    def set_routes(cls, proxy_routes):
-        cls.proxy_routes = proxy_routes
+class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        parts = self.path.split('/')
-        print(parts)
-        if len(parts) > 3:
-            path_part = parts[3]
-            body = ""  # GET requests typically do not have a body
-            live_data = ExtractFeatures(path_part, body)
-            live_data = np.array(live_data).reshape(1, -1)  # Reshape for single prediction
-
-            # Load the model inside the request handler
-            with open('training_model.pkl', 'rb') as file:
-                model = pickle.load(file)
-
-            result = model.predict(live_data)  # Use the trained model for prediction
-            print(result[0])
-            if result[0] == 1:
-                print('Intrusion Detected')
-
-        if len(parts) >= 2:
-            self.proxy_request('http://' + parts[2] + '/')
-        else:
-            super().do_GET()
-
-    def proxy_request(self, url):
-        try:
-            response = request.urlopen(url)
-        except error.HTTPError as e:
-            print('err')
-            self.send_response_only(e.code)
+        if self.path == "/":
+            self.send_response(200)
             self.end_headers()
+            self.wfile.write(b"<h1>Welcome to Web Application Firewall Proxy</h1>")
             return
-        self.send_response_only(response.status)
-        for name, value in response.headers.items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.copyfile(response, self.wfile)
+
+        # Expected format: /proxy_route/domain.com/path?params
+        if self.path.startswith("/proxy_route/"):
+            try:
+                target = self.path[len("/proxy_route/"):]
+                url = f"http://{target}"
+                parsed_url = urlparse(url)
+
+                # Feature extraction for ML model
+                features = extract_features(parsed_url.path + "?" + (parsed_url.query or ""))
+                result = model.predict([features])
+
+                # Log the request
+                print(f"🔍 Scanning URL: {url}")
+                if result[0] == 1:
+                    print("🚫 Intrusion Detected!")
+                    with open("intrusion_log.txt", "a") as f:
+                        f.write(f"Blocked: {url}\n")
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"403 Forbidden: Intrusion Detected")
+                    return
+
+                # Forward request to actual server
+                with urllib.request.urlopen(url) as response:
+                    content = response.read()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(content)
+
+            except Exception as e:
+                print("❌ Proxy error:", e)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"500 Internal Server Error")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
+
+    def do_POST(self):
+        # Very basic POST handler, extracts and forwards
+        if self.path.startswith("/proxy_route/"):
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+
+                target = self.path[len("/proxy_route/"):]
+                url = f"http://{target}"
+                parsed_url = urlparse(url)
+
+                # Feature extraction
+                features = extract_features(parsed_url.path + "?" + post_data.decode())
+                result = model.predict([features])
+
+                print(f"🔍 Scanning POST to: {url}")
+                if result[0] == 1:
+                    print("🚫 Intrusion Detected in POST!")
+                    with open("intrusion_log.txt", "a") as f:
+                        f.write(f"Blocked POST: {url}\n")
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"403 Forbidden: Intrusion Detected (POST)")
+                    return
+
+                # Forward the POST request
+                req = urllib.request.Request(url, data=post_data, method='POST')
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                with urllib.request.urlopen(req) as response:
+                    content = response.read()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(content)
+
+            except Exception as e:
+                print("❌ POST Proxy error:", e)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"500 Internal Server Error")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
 
 
-# Set up and start the server
-SimpleHTTPProxy.set_routes({'proxy_route': 'http://demo.testfire.net/'})
-with HTTPServer(('127.0.0.1', 8080), SimpleHTTPProxy) as httpd:  # Correct reference to HTTPServer
-    host, port = httpd.socket.getsockname()
-    print(f'Listening on http://{host}:{port}')
-    try:
-        httpd.serve_forever()  # Corrected from serveforever to serve_forever
-    except KeyboardInterrupt:  # Corrected from keyboardInterrupt to KeyboardInterrupt
-        print("\nKeyboard interrupt received, exiting.")
+def extract_features(query_string):
+    length = len(query_string)
+    digit_count = len(re.findall(r"\d", query_string))
+    alpha_count = len(re.findall(r"[a-zA-Z]", query_string))
+    special_count = len(re.findall(r"\W", query_string))
+    sql_keywords = int(bool(re.search(r"(select|union|insert|drop|--|;)", query_string, re.IGNORECASE)))
+
+    uppercase_count = len(re.findall(r"[A-Z]", query_string))
+    lowercase_count = len(re.findall(r"[a-z]", query_string))
+    space_count = len(re.findall(r"\s", query_string))
+
+    # param_count: number of parameters in query if any
+    param_count = 0
+    if "?" in query_string:
+        parsed_qs = parse_qs(urlparse(query_string).query)
+        param_count = len(parsed_qs)
+
+    digit_ratio = digit_count / length if length > 0 else 0
+    alpha_ratio = alpha_count / length if length > 0 else 0
+    special_ratio = special_count / length if length > 0 else 0
+
+    return [
+        length,
+        digit_count,
+        alpha_count,
+        special_count,
+        sql_keywords,
+        uppercase_count,
+        lowercase_count,
+        space_count,
+        param_count,
+        digit_ratio,
+        alpha_ratio,
+        special_ratio
+    ]
+
+if __name__ == "__main__":
+    with socketserver.TCPServer(("", PORT), ProxyHTTPRequestHandler) as httpd:
+        print(f"🚀 Listening on http://127.0.0.1:{PORT}")
+        httpd.serve_forever()

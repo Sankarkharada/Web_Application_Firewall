@@ -1,0 +1,4 @@
+Blocked: http://demo.testfire.net/login.jsp
+Blocked: http://demo.testfire.net/login.jsp?user=admin%27--&pass=123
+Blocked: http://demo.testfire.net/login.jsp
+Blocked: http://example.com?admin%27--&pass%20123
